@@ -1,9 +1,15 @@
-FROM photon:4.0
-LABEL maintainer="Michael Stanclift <https://github.com/vmstan>"
+FROM debian:bookworm-slim
 
-RUN tdnf update -y \
-    && tdnf install -y curl git rsync openssh
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       rsync openssh-client inotify-tools sudo \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN curl -sSL http://gravity.vmstan.com/beta | GS_DOCKER=1 && GS_DEV=4.0.0 bash
+COPY gravity-sync /usr/local/bin/gravity-sync
+RUN chmod +x /usr/local/bin/gravity-sync
 
-CMD gravity-sync version
+RUN mkdir -p /etc/gravity-sync
+
+VOLUME ["/etc/gravity-sync"]
+
+CMD ["gravity-sync", "version"]

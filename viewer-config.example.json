@@ -1,0 +1,13 @@
+{
+    "pihole_1": {
+        "name": "Primary",
+        "url": "http://192.168.179.200:5336",
+        "password": "YOUR_PIHOLE_PASSWORD_HERE"
+    },
+    "pihole_2": {
+        "name": "Secondary",
+        "url": "http://192.168.179.60:5336",
+        "password": "YOUR_PIHOLE_PASSWORD_HERE"
+    },
+    "listen_port": 8088
+}

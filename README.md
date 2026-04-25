@@ -22,6 +22,7 @@ But if you have redundant Pi-hole in your network you'll want a simple way to ke
 - `pihole restartdns` replaced with `pihole reloaddns` / `pihole reloadlists`
 - Custom DNS records path updated to `hosts/custom.list`
 - CNAME and static DHCP sync now uses the FTL config API (`pihole-FTL --config`) instead of dnsmasq config files, which were removed in v6
+- Full TOML config sync — 30+ configurable keys (DNS settings, blocking, cache, DHCP, resolver, database)
 - Automatic Pi-hole v6 detection — falls back to legacy dnsmasq file sync if v6 is not detected
 
 ## Features
@@ -37,6 +38,7 @@ Gravity Sync also replicates local network DNS/DHCP settings, which includes:
 - Local DNS Records.
 - Local CNAME Records (via FTL config API on v6).
 - Static DHCP Assignments (via FTL config API on v6).
+- All configurable pihole.toml keys (see `PH_V6_TOML_SYNC_KEYS` in ENV.md).
 
 ### Limitations
 
@@ -84,6 +86,28 @@ sudo cp templates/gravity-sync.timer /etc/systemd/system/
 sudo systemctl enable --now gravity-sync.timer
 ```
 
+## Docker
+
+```bash
+docker build -t gravity-sync .
+docker run -v /path/to/gravity-sync.conf:/etc/gravity-sync/gravity-sync.conf \
+           -v /path/to/ssh-key:/root/.ssh/id_ed25519:ro \
+           gravity-sync push
+```
+
+## Pi-hole Query Viewer
+
+A standalone Python tool that merges query logs from both Pi-hole instances into a single filterable web view. No external dependencies required.
+
+```bash
+cp viewer-config.example.json viewer-config.json
+# Edit viewer-config.json with your Pi-hole URLs and passwords
+python3 pihole-query-viewer.py
+# Open http://localhost:8088
+```
+
+Filters: domain search, allowed/blocked status, primary/secondary source, DNS type, upstream server.
+
 ## Disclaimer
 
 Gravity Sync is not developed by or affiliated with the Pi-hole project. This is an unofficial, community effort, that seeks to implement replication (which is currently not a part of the core Pi-hole product) in a way that provides stability and value to Pi-hole users. The code has been tested across multiple user environments but there always is an element of risk involved with running any arbitrary software you find on the Internet.
@@ -92,5 +116,6 @@ Pi-hole is and the Pi-hole logo are [registered trademarks](https://pi-hole.net/
 
 ## Additional Documentation
 
+- [Environment Variables](ENV.md)
 - [Frequently Asked Questions](https://github.com/vmstan/gravity-sync/wiki/Frequent-Questions)
 - [Changelog](https://github.com/vmstan/gravity-sync/wiki/Changelog)

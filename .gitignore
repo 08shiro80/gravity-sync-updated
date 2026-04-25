@@ -4,3 +4,5 @@ dev
 .nova
 settings/*
 logs/*
+viewer-config.json
+*.db
