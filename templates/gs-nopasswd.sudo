@@ -1,1 +1,1 @@
-pi ALL=NOPASSWD: /etc/pihole
+pi ALL=(ALL) NOPASSWD: /usr/local/bin/gravity-sync, /usr/local/bin/gravity-sync-watch.sh, /usr/bin/pihole-FTL, /usr/local/bin/pihole

@@ -1,0 +1,13 @@
+[Unit]
+Description=Gravity Sync File Watcher (event-based Pi-hole sync)
+After=network-online.target pihole-FTL.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gravity-sync-watch.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

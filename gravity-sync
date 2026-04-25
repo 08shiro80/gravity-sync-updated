@@ -4,10 +4,10 @@ GS_RUN_START=$SECONDS
 
 # GRAVITY SYNC BY VMSTAN #####################
 PROGRAM='Gravity Sync'
-GS_VERSION='4.0.7'
+GS_VERSION='6.4.1'
 
 # For documentation or the changelog/updates visit https://github.com/vmstan/gravity-sync
-# Requires Pi-Hole 5.x or higher already be installed, for help visit https://pi-hole.net
+# Requires Pi-hole v6.x or higher already be installed, for help visit https://pi-hole.net
 
 # REQUIRED SETTINGS ##########################
 
@@ -49,9 +49,15 @@ PIHOLE_CONTAINER_IMAGE=${PIHOLE_CONTAINER_IMAGE:-'pihole/pihole'}           # Of
 ###############################################
 
 PH_GRAVITY_FI=${PH_GRAVITY_FI:-'gravity.db'}                        # Pi-hole database file name
-PH_CUSTOM_DNS=${PH_CUSTOM_DNS:-'custom.list'}                       # Pi-hole DNS lookup filename
+PH_CUSTOM_DNS=${PH_CUSTOM_DNS:-'hosts/custom.list'}                       # Pi-hole DNS lookup filename
 PH_CNAME_CONF=${PH_CNAME_CONF:-'05-pihole-custom-cname.conf'}       # DNSMASQ CNAME alias file
 PH_SDHCP_CONF=${PH_SDHCP_CONF:-'04-pihole-static-dhcp.conf'}        # DNSMASQ Static DHCP file
+PH_V6_CNAME_KEY='dns.cnameRecords'                                 # Pi-hole v6 FTL CNAME config key
+PH_V6_SDHCP_KEY='dhcp.hosts'                                       # Pi-hole v6 FTL static DHCP config key
+
+# Pi-hole v6 TOML config keys to sync (array-type and scalar-type)
+# Override in gravity-sync.conf to customize
+PH_V6_TOML_SYNC_KEYS=${PH_V6_TOML_SYNC_KEYS:-'dns.hosts dns.cnameRecords dns.upstreams dns.revServers dhcp.hosts dns.CNAMEdeepInspect dns.blockESNI dns.domainNeeded dns.expandHosts dns.bogusPriv dns.dnssec dns.queryLogging dns.localise dns.domain.name dns.domain.local dns.cache.size dns.cache.optimizer dns.cache.upstreamBlockedTTL dns.blocking.active dns.blocking.mode dns.blocking.edns dns.specialDomains.mozillaCanary dns.specialDomains.iCloudPrivateRelay dns.specialDomains.designatedResolver dns.rateLimit.count dns.rateLimit.interval resolver.resolveIPv4 resolver.resolveIPv6 resolver.refreshNames database.maxDBdays database.DBinterval'}
 
 # Backup Customization
 GS_BACKUP_TIMEOUT=${GS_BACKUP_TIMEOUT:-'240'}                       # replace in gravity-sync.conf to overwrite
@@ -215,6 +221,7 @@ function start_gs {
     detect_remote_pihole
     detect_gs_peer
     set_pihole_exec
+    detect_v6_mode
 
     MESSAGE="${UI_CORE_EVALUATING}"
     echo_stat
@@ -291,6 +298,81 @@ function  set_pihole_exec {
     fi
 }
 
+## Detect Pi-hole v6 mode (FTL config API available, dnsmasq files gone)
+function detect_v6_mode {
+    GS_V6_MODE="0"
+    if [ ! -f "${LOCAL_DNSMASQ_DIRECTORY}/${PH_CNAME_CONF}" ]; then
+        if sudo ${FTL_EXEC} --config -q ${PH_V6_CNAME_KEY} >/dev/null 2>&1; then
+            GS_V6_MODE="1"
+            MESSAGE="Pi-hole v6 detected, using FTL config API for CNAME/DHCP sync"
+            echo_info
+        fi
+    fi
+}
+
+## Pull all v6 TOML config keys from remote
+## Handles both scalar values and arrays (re-quotes array entries for valid JSON)
+function pull_gs_toml_v6 {
+    if [ "${GS_V6_MODE}" != "1" ]; then return; fi
+
+    for V6_KEY in ${PH_V6_TOML_SYNC_KEYS}; do
+        MESSAGE="${UI_PULL_REMOTE} ${V6_KEY} (v6 config)"
+        echo_stat
+        V6_REMOTE_VAL=$(timeout --preserve-status ${GS_BACKUP_TIMEOUT} ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "sudo ${RFTL_EXEC} --config -q ${V6_KEY}" 2>/dev/null)
+
+        if [ -n "${V6_REMOTE_VAL}" ]; then
+            case "${V6_REMOTE_VAL}" in
+                \[*)
+                    V6_REMOTE_VAL=$(echo "${V6_REMOTE_VAL}" | sed 's/\[ */[ /;s/ *\]/ ]/;s/, /\n/g' | sed 's/^ *//;s/ *$//' | while IFS= read -r entry; do
+                        entry=$(echo "${entry}" | sed 's/^\[[ ]*//' | sed 's/[ ]*\]$//')
+                        [ -z "${entry}" ] && continue
+                        entry=$(echo "${entry}" | sed 's/^"//;s/"$//')
+                        printf '"%s", ' "${entry}"
+                    done | sed 's/, $//')
+                    V6_REMOTE_VAL="[ ${V6_REMOTE_VAL} ]"
+                    ;;
+            esac
+            sudo ${FTL_EXEC} --config ${V6_KEY} "${V6_REMOTE_VAL}" >/dev/null 2>&1
+            error_validate
+        else
+            echo_good
+        fi
+    done
+}
+
+## Push all v6 TOML config keys to remote (uses base64 to safely transfer values over SSH)
+## Handles both scalar values and arrays (re-quotes array entries for valid JSON)
+function push_gs_toml_v6 {
+    if [ "${GS_V6_MODE}" != "1" ]; then return; fi
+
+    for V6_KEY in ${PH_V6_TOML_SYNC_KEYS}; do
+        MESSAGE="${UI_PUSH_LOCAL} ${V6_KEY} (v6 config)"
+        echo_stat
+        V6_LOCAL_VAL=$(sudo ${FTL_EXEC} --config -q ${V6_KEY} 2>/dev/null)
+
+        if [ -n "${V6_LOCAL_VAL}" ]; then
+            # If value starts with '[', it's an array — re-quote entries for valid JSON
+            case "${V6_LOCAL_VAL}" in
+                \[*)
+                    V6_LOCAL_VAL=$(echo "${V6_LOCAL_VAL}" | sed 's/\[ */[ /;s/ *\]/ ]/;s/, /\n/g' | sed 's/^ *//;s/ *$//' | while IFS= read -r entry; do
+                        entry=$(echo "${entry}" | sed 's/^\[[ ]*//' | sed 's/[ ]*\]$//')
+                        [ -z "${entry}" ] && continue
+                        # Strip existing quotes if any, then re-add
+                        entry=$(echo "${entry}" | sed 's/^"//;s/"$//')
+                        printf '"%s", ' "${entry}"
+                    done | sed 's/, $//')
+                    V6_LOCAL_VAL="[ ${V6_LOCAL_VAL} ]"
+                    ;;
+            esac
+            V6_B64=$(printf '%s' "${V6_LOCAL_VAL}" | base64 -w0)
+            timeout --preserve-status ${GS_BACKUP_TIMEOUT} ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} "V6_VAL=\$(echo ${V6_B64} | base64 -d) && sudo ${RFTL_EXEC} --config ${V6_KEY} \"\${V6_VAL}\"" >/dev/null 2>&1
+            error_validate
+        else
+            echo_good
+        fi
+    done
+}
+
 ## Compare Task
 function task_compare {
     start_gs
@@ -365,8 +447,9 @@ function pull_gs_custom {
     fi
 }
 
-## Pull CNAME
+## Pull CNAME (legacy dnsmasq file, skipped in v6)
 function pull_gs_cname {
+    if [ "${GS_V6_MODE}" == "1" ]; then return; fi
     if [ "$REMOTE_CNAME_DNS" == "1" ]; then
         backup_local_cname
         backup_remote_cname
@@ -387,8 +470,9 @@ function pull_gs_cname {
     fi
 }
 
-## Pull DHCP
+## Pull DHCP (legacy dnsmasq file, skipped in v6)
 function pull_gs_sdhcp {
+    if [ "${GS_V6_MODE}" == "1" ]; then return; fi
     if [ "$REMOTE_SDHCP_DNS" == "1" ]; then
         backup_local_sdhcp
         backup_remote_sdhcp
@@ -415,20 +499,20 @@ function pull_gs_reload {
 
     MESSAGE="Updating local FTLDNS configuration"
     echo_stat
-    ${PH_EXEC} restartdns reload-lists >/dev/null 2>&1
+    ${PH_EXEC} reloadlists >/dev/null 2>&1
     error_validate
 
     if [ "${GS_TASK_TYPE}" == SMART ]; then
         if [ "${REMOTE_DNS_CHANGE}" == "1" ] || [ "${LOCAL_DNS_CHANGE}" == "1" ] || [ "${REMOTE_CNAME_CHANGE}" == "1" ] || [ "${LOCAL_CNAME_CHANGE}" == "1" ] || [ "${REMOTE_SDHCP_CHANGE}" == "1" ] || [ "${LOCAL_SDHCP_CHANGE}" == "1" ]; then
             MESSAGE="${UI_FTLDNS_CONFIG_PULL_RELOAD}"
             echo_stat
-            ${PH_EXEC} restartdns >/dev/null 2>&1
+            ${PH_EXEC} reloaddns >/dev/null 2>&1
             error_validate
         fi
     else
         MESSAGE="${UI_FTLDNS_CONFIG_PULL_RELOAD}"
         echo_stat
-        ${PH_EXEC} restartdns >/dev/null 2>&1
+        ${PH_EXEC} reloaddns >/dev/null 2>&1
         error_validate
     fi
 }
@@ -441,6 +525,7 @@ function pull_gs {
     pull_gs_custom
     pull_gs_cname
     pull_gs_sdhcp
+    pull_gs_toml_v6
     pull_gs_reload
     md5_recheck
     logs_export
@@ -515,8 +600,9 @@ function push_gs_custom {
     fi
 }
 
-## Push Custom
+## Push CNAME (legacy dnsmasq file, skipped in v6)
 function push_gs_cname {
+    if [ "${GS_V6_MODE}" == "1" ]; then return; fi
     if [ "$REMOTE_CNAME_DNS" == "1" ]; then
         backup_remote_cname
         backup_local_cname
@@ -543,8 +629,9 @@ function push_gs_cname {
     fi
 }
 
-## Push Custom
+## Push SDHCP (legacy dnsmasq file, skipped in v6)
 function push_gs_sdhcp {
+    if [ "${GS_V6_MODE}" == "1" ]; then return; fi
     if [ "$REMOTE_SDHCP_DNS" == "1" ]; then
         backup_remote_sdhcp
         backup_local_sdhcp
@@ -578,7 +665,7 @@ function push_gs_reload {
     MESSAGE="Updating remote FTLDNS configuration"
     echo_stat
     CMD_TIMEOUT=$GS_BACKUP_TIMEOUT
-    CMD_REQUESTED="${RH_EXEC} restartdns reload-lists"
+    CMD_REQUESTED="sudo ${RH_EXEC} reloadlists"
     create_ssh_cmd
 
     if [ "${GS_TASK_TYPE}" == SMART ]; then
@@ -586,14 +673,14 @@ function push_gs_reload {
             MESSAGE="${UI_FTLDNS_CONFIG_PUSH_RELOAD}"
             echo_stat
             CMD_TIMEOUT=$GS_BACKUP_TIMEOUT
-            CMD_REQUESTED="${RH_EXEC} restartdns"
+            CMD_REQUESTED="sudo ${RH_EXEC} reloaddns"
             create_ssh_cmd
         fi
     else
         MESSAGE="${UI_FTLDNS_CONFIG_PUSH_RELOAD}"
         echo_stat
         CMD_TIMEOUT=$GS_BACKUP_TIMEOUT
-        CMD_REQUESTED="${RH_EXEC} restartdns"
+        CMD_REQUESTED="sudo ${RH_EXEC} reloaddns"
         create_ssh_cmd
     fi
 }
@@ -606,6 +693,7 @@ function push_gs {
     push_gs_custom
     push_gs_cname
     push_gs_sdhcp
+    push_gs_toml_v6
     push_gs_reload
     md5_recheck
     logs_export
@@ -770,8 +858,10 @@ function smart_gs {
             fi
         fi
     else
-        pull_gs_cname
-        GS_PULL_RESTART="1"
+        if [ "${GS_V6_MODE}" != "1" ]; then
+            pull_gs_cname
+            GS_PULL_RESTART="1"
+        fi
     fi
 
     if [ "${REMOTE_SDHCP_MD5}" != "${LAST_REMOTE_SDHCP_MD5}" ]; then
@@ -815,8 +905,17 @@ function smart_gs {
             fi
         fi
     else
-        pull_gs_sdhcp
-        GS_PULL_RESTART="1"
+        if [ "${GS_V6_MODE}" != "1" ]; then
+            pull_gs_sdhcp
+            GS_PULL_RESTART="1"
+        fi
+    fi
+
+    if [ "${GS_V6_MODE}" == "1" ]; then
+        if [ "$GS_HASH_MARK" != "0" ]; then
+            push_gs_toml_v6
+            GS_PUSH_RESTART="1"
+        fi
     fi
 
     if [ "$GS_PULL_RESTART" == "1" ]; then
@@ -838,13 +937,13 @@ function backup_local_gravity {
     echo_stat
 
     if [ "$LOCAL_PIHOLE_TYPE" == "default" ]; then
-        sudo ${FTL_EXEC} sql ${LOCAL_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} ".backup '${LOCAL_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'"
+        sudo ${FTL_EXEC} sqlite3 -ni ${LOCAL_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} ".backup '${LOCAL_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'"
         error_validate
     elif [ "$LOCAL_PIHOLE_TYPE" == "docker" ]; then
-        sudo ${FTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} ".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'"
+        sudo ${FTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} ".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'"
         error_validate
     elif [ "$LOCAL_PIHOLE_TYPE" == "podman" ]; then
-        sudo ${FTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} ".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'"
+        sudo ${FTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} ".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'"
         error_validate
     fi
 }
@@ -856,13 +955,13 @@ function backup_local_gravity_integrity {
     sleep $GS_BACKUP_INTEGRITY_WAIT
 
     if [ "$LOCAL_PIHOLE_TYPE" == "default" ]; then
-        LOCAL_INTEGRITY_CHECK=$(${FTL_EXEC} sql ${LOCAL_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;' | sed 's/\s.*$//')
+        LOCAL_INTEGRITY_CHECK=$(${FTL_EXEC} sqlite3 -ni ${LOCAL_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;' | sed 's/\s.*$//')
         error_validate
     elif [ "$LOCAL_PIHOLE_TYPE" == "docker" ]; then
-        LOCAL_INTEGRITY_CHECK=$(${FTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;' | sed 's/\s.*$//')
+        LOCAL_INTEGRITY_CHECK=$(${FTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;' | sed 's/\s.*$//')
         error_validate
     elif [ "$LOCAL_PIHOLE_TYPE" == "podman" ]; then
-        LOCAL_INTEGRITY_CHECK=$(${FTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;' | sed 's/\s.*$//')
+        LOCAL_INTEGRITY_CHECK=$(${FTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;' | sed 's/\s.*$//')
         error_validate
     fi
 
@@ -925,15 +1024,15 @@ function backup_remote_gravity {
 
     if [ "$REMOTE_PIHOLE_TYPE" == "default" ]; then
         CMD_TIMEOUT=$GS_BACKUP_TIMEOUT
-        CMD_REQUESTED="sudo ${RFTL_EXEC} sql ${REMOTE_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} \".backup '${REMOTE_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'\""
+        CMD_REQUESTED="sudo ${RFTL_EXEC} sqlite3 -ni ${REMOTE_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} \".backup '${REMOTE_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'\""
         create_ssh_cmd
     elif [ "$REMOTE_PIHOLE_TYPE" == "docker" ]; then
         CMD_TIMEOUT=$GS_BACKUP_TIMEOUT
-        CMD_REQUESTED="sudo ${RFTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} \".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'\""
+        CMD_REQUESTED="sudo ${RFTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} \".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'\""
         create_ssh_cmd
     elif [ "$REMOTE_PIHOLE_TYPE" == "podman" ]; then
         CMD_TIMEOUT=$GS_BACKUP_TIMEOUT
-        CMD_REQUESTED="sudo ${RFTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} \".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'\""
+        CMD_REQUESTED="sudo ${RFTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI} \".backup '${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT}'\""
         create_ssh_cmd
     fi
 }
@@ -945,13 +1044,13 @@ function backup_remote_gravity_integrity {
     sleep $GS_BACKUP_INTEGRITY_WAIT
 
     if [ "$REMOTE_PIHOLE_TYPE" == "default" ]; then
-        REMOTE_INTEGRITY_CHECK=$(${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "${RFTL_EXEC} sql ${REMOTE_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;'" | sed 's/\s.*$//')
+        REMOTE_INTEGRITY_CHECK=$(${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "${RFTL_EXEC} sqlite3 -ni ${REMOTE_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;'" | sed 's/\s.*$//')
         error_validate
     elif [ "$REMOTE_PIHOLE_TYPE" == "docker" ]; then
-        REMOTE_INTEGRITY_CHECK=$(${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "${RFTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;'" | sed 's/\s.*$//')
+        REMOTE_INTEGRITY_CHECK=$(${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "${RFTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;'" | sed 's/\s.*$//')
         error_validate
     elif [ "$REMOTE_PIHOLE_TYPE" == "podman" ]; then
-        REMOTE_INTEGRITY_CHECK=$(${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "${RFTL_EXEC} sql ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;'" | sed 's/\s.*$//')
+        REMOTE_INTEGRITY_CHECK=$(${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "${RFTL_EXEC} sqlite3 -ni ${DEFAULT_PIHOLE_DIRECTORY}/${PH_GRAVITY_FI}.${GS_BACKUP_EXT} 'PRAGMA integrity_check;'" | sed 's/\s.*$//')
         error_validate
     fi
 
@@ -1098,15 +1197,36 @@ function md5_compare {
             echo_warn
         fi
     else
-        if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_CNAME_CONF}; then
+        if [ "${GS_V6_MODE}" == "1" ]; then
             REMOTE_CNAME_DNS="1"
-            MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_DETECTED} ${UI_HASHING_REMOTE}"
-            GS_HASH_MARK=$((GS_HASH_MARK+1))
+            MESSAGE="${UI_HASHING_HASHING} ${UI_CNAME_NAME} (v6 config)"
+            echo_stat
+            REMOTE_CN_MD5=$(timeout --preserve-status ${GS_BACKUP_TIMEOUT} ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "sudo ${RFTL_EXEC} --config -q ${PH_V6_CNAME_KEY} | md5sum" | sed 's/\s.*$//')
+            error_validate
+
+            MESSAGE="${UI_HASHING_COMPARING} ${UI_CNAME_NAME} (v6 config)"
+            echo_stat
+            LOCAL_CN_MD5=$(sudo ${FTL_EXEC} --config -q ${PH_V6_CNAME_KEY} | md5sum | sed 's/\s.*$//')
+            error_validate
+
+            if [ "$REMOTE_CN_MD5" == "$LAST_REMOTE_CN_MD5" ] && [ "$LOCAL_CN_MD5" == "$LAST_LOCAL_CN_MD5" ]; then
+                GS_HASH_MARK=$((GS_HASH_MARK+0))
+            else
+                MESSAGE="${UI_HASHING_DIFFERENCE} ${UI_CNAME_NAME}"
+                echo_warn
+                GS_HASH_MARK=$((GS_HASH_MARK+1))
+            fi
+        else
+            if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_CNAME_CONF}; then
+                REMOTE_CNAME_DNS="1"
+                MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_DETECTED} ${UI_HASHING_REMOTE}"
+                GS_HASH_MARK=$((GS_HASH_MARK+1))
+                echo_warn
+            fi
+
+            MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
             echo_warn
         fi
-
-        MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
-        echo_warn
     fi
 
     if [ -f ${LOCAL_DNSMASQ_DIRECTORY}/${PH_SDHCP_CONF} ]; then
@@ -1139,15 +1259,58 @@ function md5_compare {
             echo_warn
         fi
     else
-        if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_SDHCP_CONF}; then
+        if [ "${GS_V6_MODE}" == "1" ]; then
             REMOTE_SDHCP_DNS="1"
-            MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_DETECTED} ${UI_HASHING_REMOTE}"
-            GS_HASH_MARK=$((GS_HASH_MARK+1))
+            MESSAGE="${UI_HASHING_HASHING} ${UI_SDHCP_NAME} (v6 config)"
+            echo_stat
+            REMOTE_SDHCP_MD5=$(timeout --preserve-status ${GS_BACKUP_TIMEOUT} ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "sudo ${RFTL_EXEC} --config -q ${PH_V6_SDHCP_KEY} | md5sum" | sed 's/\s.*$//')
+            error_validate
+
+            MESSAGE="${UI_HASHING_COMPARING} ${UI_SDHCP_NAME} (v6 config)"
+            echo_stat
+            LOCAL_SDHCP_MD5=$(sudo ${FTL_EXEC} --config -q ${PH_V6_SDHCP_KEY} | md5sum | sed 's/\s.*$//')
+            error_validate
+
+            if [ "$REMOTE_SDHCP_MD5" == "$LAST_REMOTE_SDHCP_MD5" ] && [ "$LOCAL_SDHCP_MD5" == "$LAST_LOCAL_SDHCP_MD5" ]; then
+                GS_HASH_MARK=$((GS_HASH_MARK+0))
+            else
+                MESSAGE="${UI_HASHING_DIFFERENCE} ${UI_SDHCP_NAME}"
+                echo_warn
+                GS_HASH_MARK=$((GS_HASH_MARK+1))
+            fi
+        else
+            if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_SDHCP_CONF}; then
+                REMOTE_SDHCP_DNS="1"
+                MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_DETECTED} ${UI_HASHING_REMOTE}"
+                GS_HASH_MARK=$((GS_HASH_MARK+1))
+                echo_warn
+            fi
+
+            MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
             echo_warn
         fi
+    fi
 
-        MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
-        echo_warn
+    if [ "${GS_V6_MODE}" == "1" ]; then
+        MESSAGE="${UI_HASHING_HASHING} v6 TOML config"
+        echo_stat
+        REMOTE_TOML_MD5=$(timeout --preserve-status ${GS_BACKUP_TIMEOUT} ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "for k in ${PH_V6_TOML_SYNC_KEYS}; do sudo ${RFTL_EXEC} --config -q \\\$k; done | md5sum" | sed 's/\s.*$//')
+        error_validate
+
+        MESSAGE="${UI_HASHING_COMPARING} v6 TOML config"
+        echo_stat
+        LOCAL_TOML_MD5=""
+        for k in ${PH_V6_TOML_SYNC_KEYS}; do
+            LOCAL_TOML_MD5="${LOCAL_TOML_MD5}$(sudo ${FTL_EXEC} --config -q ${k} 2>/dev/null)"
+        done
+        LOCAL_TOML_MD5=$(echo "${LOCAL_TOML_MD5}" | md5sum | sed 's/\s.*$//')
+        error_validate
+
+        if [ "$REMOTE_TOML_MD5" != "$LOCAL_TOML_MD5" ]; then
+            MESSAGE="${UI_HASHING_DIFFERENCE} v6 TOML config"
+            echo_warn
+            GS_HASH_MARK=$((GS_HASH_MARK+1))
+        fi
     fi
 
     if [ "$GS_HASH_MARK" != "0" ]; then
@@ -1260,14 +1423,27 @@ function md5_recheck {
             echo_warn
         fi
     else
-        if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_CNAME_CONF}; then
+        if [ "${GS_V6_MODE}" == "1" ]; then
             REMOTE_CNAME_DNS="1"
-            MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_REMOTE}"
+            MESSAGE="${UI_HASHING_REHASHING} ${UI_CNAME_NAME} (v6 config)"
+            echo_stat
+            REMOTE_CN_MD5=$(timeout --preserve-status ${GS_BACKUP_TIMEOUT} ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "sudo ${RFTL_EXEC} --config -q ${PH_V6_CNAME_KEY} | md5sum" | sed 's/\s.*$//')
+            error_validate
+
+            MESSAGE="${UI_HASHING_RECOMPARING} ${UI_CNAME_NAME} (v6 config)"
+            echo_stat
+            LOCAL_CN_MD5=$(sudo ${FTL_EXEC} --config -q ${PH_V6_CNAME_KEY} | md5sum | sed 's/\s.*$//')
+            error_validate
+        else
+            if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_CNAME_CONF}; then
+                REMOTE_CNAME_DNS="1"
+                MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_REMOTE}"
+                echo_warn
+            fi
+
+            MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
             echo_warn
         fi
-
-        MESSAGE="${UI_CNAME_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
-        echo_warn
     fi
 
     if [ -f ${LOCAL_DNSMASQ_DIRECTORY}/${PH_SDHCP_CONF} ]; then
@@ -1292,14 +1468,27 @@ function md5_recheck {
             echo_warn
         fi
     else
-        if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_SDHCP_CONF}; then
+        if [ "${GS_V6_MODE}" == "1" ]; then
             REMOTE_SDHCP_DNS="1"
-            MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_REMOTE}"
+            MESSAGE="${UI_HASHING_REHASHING} ${UI_SDHCP_NAME} (v6 config)"
+            echo_stat
+            REMOTE_SDHCP_MD5=$(timeout --preserve-status ${GS_BACKUP_TIMEOUT} ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} "sudo ${RFTL_EXEC} --config -q ${PH_V6_SDHCP_KEY} | md5sum" | sed 's/\s.*$//')
+            error_validate
+
+            MESSAGE="${UI_HASHING_RECOMPARING} ${UI_SDHCP_NAME} (v6 config)"
+            echo_stat
+            LOCAL_SDHCP_MD5=$(sudo ${FTL_EXEC} --config -q ${PH_V6_SDHCP_KEY} | md5sum | sed 's/\s.*$//')
+            error_validate
+        else
+            if ${OS_SSH_CMD} -p ${GS_SSH_PORT} -i "${GS_SSH_PKIF}" ${REMOTE_USER}@${REMOTE_HOST} test -e ${REMOTE_DNSMASQ_DIRECTORY}/${PH_SDHCP_CONF}; then
+                REMOTE_SDHCP_DNS="1"
+                MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_REMOTE}"
+                echo_warn
+            fi
+
+            MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
             echo_warn
         fi
-
-        MESSAGE="${UI_SDHCP_NAME} ${UI_HASHING_NOT_DETECTED} ${UI_HASHING_LOCAL}"
-        echo_warn
     fi
 }
 

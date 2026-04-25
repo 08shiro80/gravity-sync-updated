@@ -16,8 +16,8 @@ These settings will determine, from where (locally) to where (remotely) will be 
 |----------------------------|------------------|------------|----------------------------------------------------|
 | `LOCAL_PIHOLE_DIRECTORY`   | `/etc/pihole`    | path       | Path to local pi-hole instance in the filesystem   |
 | `REMOTE_PIHOLE_DIRECTORY`  | `/etc/pihole`    | path       | Path to remote pi-hole instance in the filesystem  |
-| `LOCAL_DNSMASQ_DIRECTORY`  | `/etc/dnsmasq.d` | path       | Path to local dnsmasqd instance in the filesystem  |
-| `REMOTE_DNSMASQ_DIRECTORY` | `/etc/dnsmasq.d` | path       | Path to remote dnsmasqd instance in the filesystem |
+| `LOCAL_DNSMASQ_DIRECTORY`  | `/etc/dnsmasq.d` | path       | Path to local dnsmasqd instance in the filesystem (legacy, not used in Pi-hole v6) |
+| `REMOTE_DNSMASQ_DIRECTORY` | `/etc/dnsmasq.d` | path       | Path to remote dnsmasqd instance in the filesystem (legacy, not used in Pi-hole v6) |
 | `LOCAL_FILE_OWNER`         | `pihole:pihole`  | user:group | Local owner and group of the pi-hole config        |
 | `REMOTE_FILE_OWNER`        | `pihole:pihole`  | user:group | Remote owner and group of the pi-hole config       |
 
@@ -45,13 +45,15 @@ These settings are most likely the same on all systems. No need to touch them bu
 | `PIHOLE_CONTAINER_IMAGE`   | `pihole/pihole`         | path  | Name of the default pi-hole docker image                                                                                                                                                   |
 
 ### Nitty-gritty finetuning the target files
-Here, you can specifiy the Gravity, DNS (A, CNAME) and DHCP settings file of Pi-hole. It is almost certain, that these filenames do never change (except if upstream Pi-hole decides so).
-| Variable        | Default                       | Value | Description                                |
-|-----------------|-------------------------------|-------|--------------------------------------------|
-| `PH_GRAVITY_FI` | `gravity.db`                  | file  | The gravity filename (blocklist) of pihole |
-| `PH_CUSTOM_DNS` | `custom.list`                 | file  | The custom DNS (A) filename of pihole      |
-| `PH_CNAME_CONF` | `05-pihole-custom-cname.conf` | file  | The custom DNS (CNAME) filename of pihole  |
-| `PH_SDHCP_CONF` | `04-pihole-static-dhcp.conf`  | file  | The custom DHCP filename of pihole         |
+Here, you can specifiy the Gravity, DNS (A, CNAME) and DHCP settings file of Pi-hole. In Pi-hole v6, CNAME and static DHCP are managed via the FTL config API — the dnsmasq config files (`PH_CNAME_CONF`, `PH_SDHCP_CONF`) are only used as legacy fallback.
+| Variable           | Default                       | Value  | Description                                                              |
+|--------------------|-------------------------------|--------|--------------------------------------------------------------------------|
+| `PH_GRAVITY_FI`    | `gravity.db`                  | file   | The gravity filename (blocklist) of pihole                               |
+| `PH_CUSTOM_DNS`    | `hosts/custom.list`           | file   | The custom DNS (A) filename of pihole (path updated for v6)              |
+| `PH_CNAME_CONF`    | `05-pihole-custom-cname.conf` | file   | Legacy dnsmasq CNAME file (not used in Pi-hole v6)                       |
+| `PH_SDHCP_CONF`    | `04-pihole-static-dhcp.conf`  | file   | Legacy dnsmasq static DHCP file (not used in Pi-hole v6)                 |
+| `PH_V6_CNAME_KEY`  | `dns.cnameRecords`            | string | Pi-hole v6 FTL config key for CNAME records (used via `pihole-FTL --config`) |
+| `PH_V6_SDHCP_KEY`  | `dhcp.hosts`                  | string | Pi-hole v6 FTL config key for static DHCP hosts (used via `pihole-FTL --config`) |
 
 ### Backup Customization
 | Variable                   | Default | Value          | Description                                                                                   |
